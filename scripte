@@ -1,1 +1,72 @@
+## 1- Import or Add any AOI of yours
+var aoi = typeof table !== 'undefined' ? table.geometry() : defaultAOI;
 
+## 2. Sentinel-2 Cloud Masking Function (SCL-based with B12)
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3)
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10));
+    
+  var opticalBands = image.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']).divide(10000);
+  return image.addBands(opticalBands, null, true).updateMask(mask);
+}
+
+## 3. Sentinel-2 Image Collection Setup
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'SCL'])
+  .filterBounds(aoi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(maskS2clouds);
+
+## 4. Create Seasonal Composites (Baseline 2017 vs. Recent 2023)
+var baseline = s2.filterDate("2017-01-01", "2017-12-31").median();
+var recent   = s2.filterDate("2023-01-01", "2023-12-31").median();
+
+## 5. Feature Engineering: Spectral Indices (NDVI, MNDWI, NDMI, NBR)
+function addIndices(image) {
+  var ndvi  = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+  var ndmi  = image.normalizedDifference(['B8', 'B11']).rename('NDMI');
+  var nbr   = image.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return image.addBands([ndvi, mndwi, ndmi, nbr]);
+}
+
+var baselineFeat = addIndices(baseline);
+var recentFeat   = addIndices(recent);
+
+## 6. Ground Truth Reference Data (ESA WorldCover v200)
+var worldcover = ee.ImageCollection("ESA/WorldCover/v200").first()
+  .select(['Map'], ['landcover']);
+
+var recentLabel = recentFeat.addBands(worldcover);
+
+## 7. Stratified Sampling & Train/Test Split
+var samples = recentLabel.stratifiedSample({
+  numPoints: 100, // Optimized sample count for GEE App speed
+  classBand: 'landcover',
+  region: aoi,
+  scale: 30,
+  projection: 'EPSG:4326',
+  geometries: false, // Fast sampling mode
+  seed: 42,
+  tileScale: 8
+});
+
+var sampleRandom = samples.randomColumn('random', 42);
+var trainingSet  = sampleRandom.filter(ee.Filter.lt('random', 0.8));
+var testingSet   = sampleRandom.filter(ee.Filter.gte('random', 0.8));
+
+## 8. Model Training (Smile Random Forest)
+var featureNames = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'MNDWI', 'NDMI', 'NBR'];
+
+var classifier = ee.Classifier.smileRandomForest(100)
+  .train({
+    features: trainingSet,
+    classProperty: 'landcover',
+    inputProperties: featureNames
+  });
+
+## Classify recent composite
+var classified = recentFeat.classify(classifier).clip(aoi);
